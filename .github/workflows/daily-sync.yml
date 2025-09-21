@@ -1,0 +1,37 @@
+name: Sincronização Diária Sucão → Ancar
+on:
+  schedule:
+    - cron: '0 11 * * *'  # 8:00 AM Brasil
+  workflow_dispatch:  # Permite rodar manualmente
+
+env:
+  TZ: America/Sao_Paulo
+
+jobs:
+  sync-sales:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Baixar código
+        uses: actions/checkout@v4
+        
+      - name: Configurar Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: Instalar programas necessários
+        run: |
+          pip install playwright asyncio
+          playwright install chromium
+          
+      - name: Executar automação
+        env:
+          SUCAO_EMAIL: ${{ secrets.SUCAO_EMAIL }}
+          SUCAO_PASSWORD: ${{ secrets.SUCAO_PASSWORD }}
+          ANCAR_USERNAME: ${{ secrets.ANCAR_USERNAME }}
+          ANCAR_PASSWORD: ${{ secrets.ANCAR_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python sync_sales.py
