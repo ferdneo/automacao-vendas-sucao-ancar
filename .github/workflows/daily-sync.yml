@@ -25,6 +25,15 @@ jobs:
           playwright install chromium
           playwright install-deps chromium
       
+      - name: Verificar instalação
+        run: |
+          echo "Python version:"
+          python --version
+          echo "Installed packages:"
+          pip list
+          echo "Playwright browsers:"
+          playwright install --list
+      
       - name: Executar automação
         env:
           SUCAO_EMAIL: ${{ secrets.SUCAO_EMAIL }}
@@ -32,4 +41,8 @@ jobs:
           ANCAR_USERNAME: ${{ secrets.ANCAR_USERNAME }}
           ANCAR_PASSWORD: ${{ secrets.ANCAR_PASSWORD }}
           TZ: America/Sao_Paulo
-        run: python sync_sales.py
+          PYTHONUNBUFFERED: 1
+        run: |
+          echo "Starting sync_sales.py..."
+          python -u sync_sales.py 2>&1
+          echo "Script completed with exit code: $?"
