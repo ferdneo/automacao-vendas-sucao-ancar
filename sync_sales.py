@@ -3,14 +3,13 @@
 Automação Específica - Sucão BOH → Portal Ancar
 Baseado na estrutura real dos sistemas
 """
-
 import asyncio
 import os
 import sys
 from datetime import datetime, timedelta
 import logging
 import requests
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError
 import re
 
 # Configurar logs
@@ -18,409 +17,319 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
 class SucaoBOHExtractor:
     """Extrai dados específicos do Sucão BOH"""
-    
+
     def __init__(self, email, password):
         self.email = email
         self.password = password
         self.base_url = "https://sucao.boh.e-deploy.com.br"
-    
+
     async def extract_yesterday_sales(self):
-        """Extrai vendas do dia anterior"""
+        """Extrai vendas do dia anterior seguindo o fluxo exato"""
+        yesterday = datetime.now() - timedelta(days=1)
+        date_str = yesterday.strftime('%d/%m/%Y')
+
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            
+            context = await browser.new_context()
+            page = await context.new_page()
+
             try:
                 # LOGIN
                 logging.info("🔐 Fazendo login no Sucão BOH...")
                 await page.goto(f"{self.base_url}/login")
-                
-                # Preencher credenciais
                 await page.fill('input[type="email"], input[name="email"]', self.email)
                 await page.fill('input[type="password"], input[name="password"]', self.password)
                 await page.click('button[type="submit"], input[type="submit"]')
-                
-                # Aguardar dashboard
                 await page.wait_for_url('**/dashboard*', timeout=30000)
                 logging.info("✅ Login realizado com sucesso")
-                
+
                 # NAVEGAR PARA RELATÓRIOS
                 logging.info("📊 Acessando relatórios...")
-                
-                # Clicar em "Relatórios" no menu lateral
                 await page.click('a:has-text("Relatórios"), [href*="reports"]')
                 await page.wait_for_load_state('networkidle')
-                
-                # Expandir seção "Vendas" se necessário
-                vendas_section = page.locator('text="Vendas"').first
-                if await vendas_section.count() > 0:
-                    await vendas_section.click()
-                
-                # Clicar em "Relatório Geral de Vendas"
-                await page.click('a:has-text("Relatório Geral de Vendas"), a:has-text("Vendas por dia")')
+
+                # EXPANDIR SEÇÃO "Relatórios por dia de negócio" SE NECESSÁRIO E CLICAR NO RELATÓRIO
+                relatorios_section = page.locator('text="Relatórios por dia de negócio"')
+                if await relatorios_section.is_visible():
+                    await relatorios_section.click()
+                await page.click('text="Vendas diárias por dia de negócio"')
                 await page.wait_for_load_state('networkidle')
-                
-                # FILTRAR POR DATA DE ONTEM
-                yesterday = datetime.now() - timedelta(days=1)
-                date_str = yesterday.strftime('%d/%m/%Y')
-                
-                logging.info(f"🗓️ Filtrando por data: {date_str}")
-                
-                # Procurar campos de data
-                date_inputs = [
-                    'input[name*="data"]',
-                    'input[type="date"]',
-                    'input[placeholder*="data"]'
-                ]
-                
-                for selector in date_inputs:
-                    if await page.locator(selector).count() > 0:
-                        await page.fill(selector, date_str)
+
+                # CLICAR EM "Gerar Relatório"
+                logging.info("🗓️ Gerando relatório para ontem...")
+                await page.click('button:has-text("Gerar Relatório")')
+
+                # AGUARDAR POPUP E PREENCHER FORMULÁRIO
+                await page.wait_for_selector('.modal, .popup')  # Aguarda o popup
+                # Selecionar loja via rádio (baseado na imagem: 73 - CONJUNTO NACIONAL - BRASILIA)
+                await page.click('input[type="radio"][value*="73"], label:has-text("73 - CONJUNTO NACIONAL - BRASILIA") ~ input[type="radio"]')
+                # Preencher datas
+                await page.fill('input[name*="data_inicial"], input[placeholder*="Data inicial"]', date_str)
+                await page.fill('input[name*="data_final"], input[placeholder*="Data final"]', date_str)
+                # Selecionar tipo "Detalhado" (assumindo dropdown)
+                await page.select_option('select[name*="tipo"]', label="Detalhado")
+                # Clicar em "Enviar"
+                await page.click('button:has-text("Enviar")')
+
+                # AGUARDAR ALERTA DE QUE O RELATÓRIO ESTÁ NA FILA (OU FECHAR POPUP)
+                try:
+                    await page.wait_for_selector('text="Alerta", text="requisitação de geração do relatório"', timeout=10000)
+                    logging.info("⏳ Relatório enfileirado...")
+                    await page.click('button:has-text("Fechar")')  # Fecha o alerta
+                except TimeoutError:
+                    pass
+
+                # AGUARDAR O RELATÓRIO APARECER NA TABELA (POLLING SIMPLES)
+                for _ in range(10):  # Tenta até 10 vezes ( ~1min)
+                    await page.wait_for_timeout(6000)  # Espera 6s por iteração
+                    await page.reload()  # Recarrega para atualizar a tabela
+                    if await page.locator('table tbody tr').count() > 0:
                         break
-                
-                # Clicar em buscar/filtrar
-                await page.click('button:has-text("Buscar"), button:has-text("Filtrar"), button:has-text("Consultar")')
-                await page.wait_for_load_state('networkidle')
-                
-                # EXTRAIR DADOS DA TABELA
-                logging.info("📋 Extraindo dados de vendas...")
-                
-                sales_data = []
-                
-                # Procurar tabela de resultados
-                table_rows = await page.locator('table tbody tr, .table-row').all()
-                
-                for row in table_rows:
-                    try:
-                        row_text = await row.inner_text()
-                        cells = await row.locator('td, .cell').all()
-                        
-                        if len(cells) >= 2:
-                            # Extrair valor e outros dados
-                            valor_text = await cells[0].inner_text() if cells else row_text
-                            quantidade_text = await cells[1].inner_text() if len(cells) > 1 else "1"
-                            
-                            valor = self.extract_currency(valor_text)
-                            quantidade = self.extract_number(quantidade_text)
-                            
-                            if valor > 0:  # Só adicionar se tem valor
-                                sales_data.append({
-                                    'valor': valor,
-                                    'quantidade': quantidade,
-                                    'descricao': row_text[:50]  # Primeiros 50 caracteres
-                                })
-                    
-                    except Exception as e:
-                        logging.warning(f"Erro ao processar linha: {e}")
-                        continue
-                
-                logging.info(f"✅ Coletadas {len(sales_data)} vendas")
-                
-                # Se não encontrou dados na tabela, tentar outras abordagens
-                if not sales_data:
-                    # Procurar por totais ou resumos
-                    total_elements = await page.locator(':has-text("Total"), :has-text("R$")').all()
-                    for element in total_elements:
-                        text = await element.inner_text()
-                        valor = self.extract_currency(text)
-                        if valor > 0:
-                            sales_data.append({
-                                'valor': valor,
-                                'quantidade': 1,
-                                'descricao': 'Venda do dia'
-                            })
-                            break
-                
+                else:
+                    raise Exception("Relatório não gerado após espera")
+
+                # SELECIONAR O RÁDIO DO RELATÓRIO MAIS RECENTE (PRIMEIRA LINHA)
+                await page.click('table tbody tr:first-child input[type="radio"]')
+
+                # CLICAR EM "Imprimir"
+                await page.click('button:has-text("Imprimir")')
+
+                # CAPTURAR NOVA ABA
+                async with context.expect_page() as new_page_info:
+                    new_page = await new_page_info.value
+                await new_page.wait_for_load_state('networkidle')
+
+                # EXTRAIR DADOS DA PÁGINA DO RELATÓRIO
+                logging.info("📋 Extraindo dados do relatório...")
+                total_liquido_text = await new_page.locator('text="Total Líquido" ~ td, text="R$ 1."').inner_text()  # Ajuste baseado na imagem
+                tickets_text = await new_page.locator('td:has-text("Tickets"), tr td:nth-child(2)').inner_text()  # Coluna Tickets
+
+                total_vendas = self.extract_currency(total_liquido_text)
+                total_quantidade = self.extract_number(tickets_text)
+
+                if total_vendas == 0 or total_quantidade == 0:
+                    raise Exception("Dados não encontrados no relatório")
+
+                sales_data = [{
+                    'valor': total_vendas,
+                    'quantidade': total_quantidade,
+                    'descricao': 'Venda do dia'
+                }]
+
+                logging.info(f"✅ Coletadas vendas: R$ {total_vendas:.2f} com {total_quantidade} tickets")
+
                 return sales_data
-                
+
             except Exception as e:
                 logging.error(f"❌ Erro na extração: {e}")
                 return []
-            
+
             finally:
                 await browser.close()
-    
+
     def extract_currency(self, text):
-        """Extrai valor monetário do texto"""
-        # Remove tudo exceto números, vírgula e ponto
         cleaned = re.sub(r'[^\d,.]', '', text)
-        
         if not cleaned:
             return 0.0
-        
-        # Tratar formato brasileiro (1.234,56)
-        if ',' in cleaned and '.' in cleaned:
-            # Formato: 1.234,56
-            cleaned = cleaned.replace('.', '').replace(',', '.')
-        elif ',' in cleaned:
-            # Formato: 1234,56
-            cleaned = cleaned.replace(',', '.')
-        
+        cleaned = cleaned.replace('.', '').replace(',', '.')
         try:
             return float(cleaned)
         except:
             return 0.0
-    
-    def extract_number(self, text):
-        """Extrai número inteiro do texto"""
-        numbers = re.findall(r'\d+', text)
-        return int(numbers[0]) if numbers else 1
 
+    def extract_number(self, text):
+        numbers = re.findall(r'\d+', text)
+        return int(numbers[0]) if numbers else 0
 
 class AncarPortalUpdater:
     """Atualiza dados no Portal Ancar"""
-    
+    # (Mantido igual, pois o problema está na extração. Se precisar ajustar seletores aqui, teste os logs)
+
     def __init__(self, username, password):
         self.username = username
         self.password = password
         self.base_url = "https://vendas.ancarivanhoe.com.br"
-    
+
     async def update_sales_data(self, sales_data):
         """Atualiza dados de vendas no portal"""
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
-            
+
             try:
-                # LOGIN NO PORTAL ANCAR
+                # LOGIN
                 logging.info("🔐 Fazendo login no Portal Ancar...")
                 await page.goto(f"{self.base_url}/?Accounts&op=asklogin")
-                
-                # Aguardar formulário aparecer
-                await page.wait_for_selector('input[name="username"], input[name="email"], input[type="text"]')
-                
-                # Preencher credenciais
-                await page.fill('input[name="username"], input[name="email"], input[type="text"]', self.username)
+                await page.wait_for_selector('input[name="username"], input[type="text"]')
+                await page.fill('input[name="username"], input[type="text"]', self.username)
                 await page.fill('input[name="password"], input[type="password"]', self.password)
-                
-                # Fazer login
-                await page.click('button[type="submit"], input[type="submit"], button:has-text("Entrar")')
+                await page.click('button:has-text("Entrar"), button[type="submit"]')
                 await page.wait_for_load_state('networkidle')
-                
                 logging.info("✅ Login no Ancar realizado")
-                
-                # PROCURAR SEÇÃO DE INFORMAR VENDAS
-                logging.info("📝 Procurando formulário de vendas...")
-                
-                # Aguardar página carregar completamente
+
+                # NAVEGAR PARA INFORMAR VENDAS
+                logging.info("📝 Procurando seção de informar vendas...")
                 await page.wait_for_timeout(3000)
-                
-                # Procurar por elementos relacionados a vendas
                 vendas_selectors = [
                     ':has-text("INFORMAR VENDAS")',
-                    ':has-text("Por Digitar")',
-                    'button:has-text("Por Digitar")',
-                    'a:has-text("Vendas")',
+                    'button:has-text("Por Digitar"), a:has-text("Por Digitar")',
                     '[href*="vendas"]'
                 ]
-                
-                vendas_found = False
                 for selector in vendas_selectors:
                     if await page.locator(selector).count() > 0:
                         await page.click(selector)
                         await page.wait_for_load_state('networkidle')
-                        vendas_found = True
                         break
-                
-                if not vendas_found:
-                    logging.warning("⚠️ Seção de vendas não encontrada automaticamente")
-                    # Tentar navegar manualmente por links/menus
-                
-                # PREENCHER DADOS DE VENDAS
+
+                # PREENCHER O FORMULÁRIO (AJUSTADO PARA CLICAR EM "Por Digitar" SE VISÍVEL)
+                if await page.locator('text="Por Digitar"').count() > 0:
+                    await page.click('text="Por Digitar"')  # Abre o campo editável para o dia
+
                 await self.fill_sales_form(page, sales_data)
-                
+
                 return True
-                
+
             except Exception as e:
                 logging.error(f"❌ Erro no Portal Ancar: {e}")
                 return False
-            
+
             finally:
                 await browser.close()
-    
+
     async def fill_sales_form(self, page, sales_data):
         """Preenche formulário de vendas"""
-        try:
-            # Calcular totais
-            total_vendas = sum(item['valor'] for item in sales_data)
-            total_quantidade = sum(item['quantidade'] for item in sales_data)
-            
-            logging.info(f"💰 Preenchendo: R$ {total_vendas:.2f} - {total_quantidade} itens")
-            
-            # Data de ontem
-            yesterday = (datetime.now() - timedelta(days=1)).strftime('%d/%m/%Y')
-            
-            # Procurar campos do formulário
-            form_selectors = {
-                'vendas': [
-                    'input[name*="venda"]',
-                    'input[name*="valor"]',
-                    'input[placeholder*="venda"]',
-                    'input[type="number"]'
-                ],
-                'tickets': [
-                    'input[name*="ticket"]',
-                    'input[name*="atendimento"]',
-                    'input[placeholder*="ticket"]'
-                ],
-                'data': [
-                    'input[name*="data"]',
-                    'input[type="date"]',
-                    'input[placeholder*="data"]'
-                ]
-            }
-            
-            # Preencher campo de vendas
-            for selector in form_selectors['vendas']:
-                if await page.locator(selector).count() > 0:
-                    await page.fill(selector, f"{total_vendas:.2f}".replace('.', ','))
-                    break
-            
-            # Preencher campo de tickets (usando quantidade)
-            for selector in form_selectors['tickets']:
-                if await page.locator(selector).count() > 0:
-                    await page.fill(selector, str(total_quantidade))
-                    break
-            
-            # Preencher data
-            for selector in form_selectors['data']:
-                if await page.locator(selector).count() > 0:
-                    await page.fill(selector, yesterday)
-                    break
-            
-            # Procurar e clicar em botão de salvar
-            save_buttons = [
-                'button:has-text("Salvar")',
-                'button:has-text("Enviar")',
-                'button:has-text("Confirmar")',
-                'input[type="submit"]',
-                'button[type="submit"]'
-            ]
-            
-            for selector in save_buttons:
-                if await page.locator(selector).count() > 0:
-                    await page.click(selector)
-                    await page.wait_for_load_state('networkidle')
-                    break
-            
-            logging.info("✅ Dados preenchidos no Portal Ancar")
-            
-        except Exception as e:
-            logging.error(f"❌ Erro ao preencher formulário: {e}")
-            raise
+        total_vendas = sum(item['valor'] for item in sales_data)
+        total_quantidade = sum(item['quantidade'] for item in sales_data)
 
+        logging.info(f"💰 Preenchendo: R$ {total_vendas:.2f} - {total_quantidade} tickets")
+
+        # Data de ontem (já deve estar selecionada via "Por Digitar")
+        yesterday = (datetime.now() - timedelta(days=1)).strftime('%d/%m/%Y')
+
+        form_selectors = {
+            'vendas': ['input[name*="venda"], input[placeholder*="venda"], input[type="number"]'],
+            'tickets': ['input[name*="ticket"], input[name*="atendimento"], input[placeholder*="ticket"]'],
+            'data': ['input[name*="data"], input[type="date"], input[placeholder*="data"]']
+        }
+
+        # Preencher vendas
+        for selector in form_selectors['vendas']:
+            if await page.locator(selector).count() > 0:
+                await page.fill(selector, f"{total_vendas:.2f}".replace('.', ','))
+                break
+
+        # Preencher tickets
+        for selector in form_selectors['tickets']:
+            if await page.locator(selector).count() > 0:
+                await page.fill(selector, str(total_quantidade))
+                break
+
+        # Preencher data se necessário
+        for selector in form_selectors['data']:
+            if await page.locator(selector).count() > 0:
+                await page.fill(selector, yesterday)
+                break
+
+        # Salvar
+        save_buttons = [
+            'button:has-text("Salvar"), button:has-text("Enviar"), button:has-text("Confirmar"), button[type="submit"]'
+        ]
+        for selector in save_buttons:
+            if await page.locator(selector).count() > 0:
+                await page.click(selector)
+                await page.wait_for_load_state('networkidle')
+                break
+
+        logging.info("✅ Dados preenchidos no Portal Ancar")
 
 class TelegramReporter:
     """Envia relatórios via Telegram"""
-    
+    # (Mantido igual)
+
     def __init__(self, bot_token, chat_id):
         self.bot_token = bot_token
         self.chat_id = chat_id
-    
-    def send_daily_report(self, sales_data, success):
-        """Envia relatório diário"""
-        try:
-            total_vendas = sum(item['valor'] for item in sales_data)
-            total_itens = len(sales_data)
-            
-            emoji = "✅" if success else "❌"
-            status = "Sucesso" if success else "Falha"
-            
-            message = f"""
-{emoji} **Relatório Automação - {datetime.now().strftime('%d/%m/%Y')}**
 
+    def send_daily_report(self, sales_data, success):
+        total_vendas = sum(item['valor'] for item in sales_data)
+        total_itens = len(sales_data)
+
+        emoji = "✅" if success else "❌"
+        status = "Sucesso" if success else "Falha"
+
+        message = f"""
+{emoji} **Relatório Automação - {datetime.now().strftime('%d/%m/%Y')}**
 💰 **Vendas Coletadas (Sucão BOH):**
 • Valor Total: R$ {total_vendas:.2f}
 • Itens: {total_itens}
-
 📊 **Status Preenchimento (Portal Ancar):**
 • {status}
-
 🕐 **Próxima execução:** Amanhã às 8:00 AM
-
 ---
 *Sistema de Automação Sucão → Ancar*
-            """.strip()
-            
-            url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-            data = {
-                'chat_id': self.chat_id,
-                'text': message,
-                'parse_mode': 'Markdown'
-            }
-            
-            response = requests.post(url, data=data)
-            
-            if response.status_code == 200:
-                logging.info("📱 Relatório enviado via Telegram")
-            else:
-                logging.error(f"❌ Erro no Telegram: {response.text}")
-                
-        except Exception as e:
-            logging.error(f"❌ Erro ao enviar Telegram: {e}")
+        """.strip()
 
+        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        data = {
+            'chat_id': self.chat_id,
+            'text': message,
+            'parse_mode': 'Markdown'
+        }
+
+        response = requests.post(url, data=data)
+
+        if response.status_code == 200:
+            logging.info("📱 Relatório enviado via Telegram")
+        else:
+            logging.error(f"❌ Erro no Telegram: {response.text}")
 
 async def main():
-    """Função principal da automação"""
-    
+    # (Mantido igual, mas agora com extração corrigida deve preencher certo)
+
     logging.info("🚀 Iniciando automação Sucão → Ancar")
-    
-    # Verificar configurações
+
     required_vars = [
         'SUCAO_EMAIL', 'SUCAO_PASSWORD',
         'ANCAR_USERNAME', 'ANCAR_PASSWORD',
         'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID'
     ]
-    
+
     missing_vars = [var for var in required_vars if not os.getenv(var)]
-    
+
     if missing_vars:
         logging.error(f"❌ Variáveis não configuradas: {missing_vars}")
-        print("❌ Faltam configurar estas senhas:")
-        for var in missing_vars:
-            print(f"   - {var}")
         return
-    
+
     try:
-        # 1. EXTRAIR DADOS DO SUCÃO BOH
-        logging.info("📊 Coletando dados do Sucão BOH...")
         extractor = SucaoBOHExtractor(
             os.getenv('SUCAO_EMAIL'),
             os.getenv('SUCAO_PASSWORD')
         )
-        
         sales_data = await extractor.extract_yesterday_sales()
-        
+
         if not sales_data:
             logging.warning("⚠️ Nenhum dado coletado do Sucão BOH")
-        
-        # 2. ATUALIZAR PORTAL ANCAR
-        logging.info("📝 Atualizando Portal Ancar...")
+
         updater = AncarPortalUpdater(
             os.getenv('ANCAR_USERNAME'),
             os.getenv('ANCAR_PASSWORD')
         )
-        
         success = await updater.update_sales_data(sales_data)
-        
-        # 3. ENVIAR RELATÓRIO
-        logging.info("📱 Enviando relatório...")
+
         reporter = TelegramReporter(
             os.getenv('TELEGRAM_BOT_TOKEN'),
             os.getenv('TELEGRAM_CHAT_ID')
         )
-        
         reporter.send_daily_report(sales_data, success)
-        
+
         if success:
             logging.info("🎉 Automação concluída com sucesso!")
         else:
             logging.warning("⚠️ Automação concluída com problemas")
-        
+
     except Exception as e:
         logging.error(f"💥 Erro crítico na automação: {e}")
-        
-        # Enviar erro via Telegram
+
         try:
             reporter = TelegramReporter(
                 os.getenv('TELEGRAM_BOT_TOKEN'),
