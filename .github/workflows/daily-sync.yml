@@ -7,7 +7,7 @@ on:
 
 jobs:
   sync-sales:
-    runs-on: ubuntu-22.04  # Versão específica do Ubuntu
+    runs-on: ubuntu-latest
     
     steps:
       - name: Baixar código
@@ -18,32 +18,14 @@ jobs:
         with:
           python-version: '3.11'
       
-      - name: Instalar dependências do sistema
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libglib2.0-0 \
-            libnss3 \
-            libnspr4 \
-            libdbus-1-3 \
-            libatk1.0-0 \
-            libatk-bridge2.0-0 \
-            libcups2 \
-            libdrm2 \
-            libxkbcommon0 \
-            libxcomposite1 \
-            libxdamage1 \
-            libxfixes3 \
-            libxrandr2 \
-            libgbm1 \
-            libasound2t64 \
-            libatspi2.0-0
-      
-      - name: Instalar programas Python
+      - name: Instalar programas necessários
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          playwright install chromium
+      
+      - name: Instalar Playwright e navegador
+        run: |
+          playwright install --with-deps chromium
       
       - name: Executar automação
         env:
@@ -52,7 +34,4 @@ jobs:
           ANCAR_USERNAME: ${{ secrets.ANCAR_USERNAME }}
           ANCAR_PASSWORD: ${{ secrets.ANCAR_PASSWORD }}
           TZ: America/Sao_Paulo
-          PYTHONUNBUFFERED: 1
-        run: |
-          echo "Starting sync_sales.py..."
-          python -u sync_sales.py
+        run: python sync_sales.py
